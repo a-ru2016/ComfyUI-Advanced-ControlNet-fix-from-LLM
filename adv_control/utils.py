@@ -353,14 +353,20 @@ class manual_cast_clean_groupnorm(comfy.ops.manual_cast):
 
 
 # adapted from comfy/sample.py
-def prepare_mask_batch(mask: Tensor, shape: Tensor, multiplier: int=1, match_dim1=False, match_shape=False, flux_shape=None):
+def prepare_mask_batch(mask: Tensor, shape: Tensor, multiplier: int=1, match_dim1=False, match_shape=False, flux_shape=None, is_sdxl=False):
     mask = mask.clone()
     if flux_shape is not None:
         multiplier = multiplier * 0.5
         mask = torch.nn.functional.interpolate(mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1])), size=(round(flux_shape[-2]*multiplier), round(flux_shape[-1]*multiplier)), mode="bilinear")
         mask = rearrange(mask, "b c h w -> b (h w) c")
     else:
-        mask = torch.nn.functional.interpolate(mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1])), size=(round(shape[-2]*multiplier), round(shape[-1]*multiplier)), mode="bilinear")
+        # SDXLの場合はmultiplierを4に設定（通常は8）
+        if is_sdxl:
+            multiplier = 4
+        else:
+            multiplier = 8
+        # 修正後のコード (utils.py 内)
+        mask = torch.nn.functional.interpolate(mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1])), size=(shape[-2], shape[-1]), mode="bilinear")
     if match_dim1:
         if match_shape and len(shape) < 4:
             raise Exception(f"match_dim1 cannot be True if shape is under 4 dims; was {len(shape)}.")
@@ -653,6 +659,14 @@ class AdvancedControlBase:
         self.pre_run_advanced(model, percent_to_timestep_function)
     
     def pre_run_advanced(self, model, percent_to_timestep_function):
+        # SDXLかどうかを検出
+        self.is_sdxl = hasattr(model, 'model_type') and model.model_type == comfy.supported_models.SDXL
+        
+        # または、モデルの特定の属性をチェック
+        if not hasattr(self, 'is_sdxl'):
+            self.is_sdxl = False
+            if hasattr(model, 'model_config'):
+                self.is_sdxl = "sdxl" in model.model_config.config.get("version", "").lower()
         # for each timestep keyframe, calculate the start_t
         for tk in self.timestep_keyframes.keyframes:
             tk.start_t = percent_to_timestep_function(tk.start_percent)
@@ -839,34 +853,29 @@ class AdvancedControlBase:
         return out
 
     def prepare_mask_cond_hint(self, x_noisy: Tensor, t, cond, batched_number, dtype=None, direct_attn=False):
-        self._prepare_mask("mask_cond_hint", self.mask_cond_hint_original, x_noisy, t, cond, batched_number, dtype, direct_attn=direct_attn)
-        self.prepare_tk_mask_cond_hint(x_noisy, t, cond, batched_number, dtype, direct_attn=direct_attn)
+        self._prepare_mask("mask_cond_hint", self.mask_cond_hint_original, x_noisy, t, cond, batched_number, dtype, direct_attn=direct_attn, is_sdxl=self.is_sdxl)
+        self.prepare_tk_mask_cond_hint(x_noisy, t, cond, batched_number, dtype, direct_attn=direct_attn, is_sdxl=self.is_sdxl)
 
-    def prepare_tk_mask_cond_hint(self, x_noisy: Tensor, t, cond, batched_number, dtype=None, direct_attn=False):
-        return self._prepare_mask("tk_mask_cond_hint", self._current_timestep_keyframe.mask_hint_orig, x_noisy, t, cond, batched_number, dtype, direct_attn=direct_attn)
+    def prepare_tk_mask_cond_hint(self, x_noisy: Tensor, t, cond, batched_number, dtype=None, direct_attn=False, is_sdxl=False):
+        return self._prepare_mask("tk_mask_cond_hint", self._current_timestep_keyframe.mask_hint_orig, x_noisy, t, cond, batched_number, dtype, direct_attn=direct_attn, is_sdxl=is_sdxl)
 
-    def prepare_weight_mask_cond_hint(self, x_noisy: Tensor, batched_number, dtype=None):
-        return self._prepare_mask("weight_mask_cond_hint", self.weights.weight_mask, x_noisy, t=None, cond=None, batched_number=batched_number, dtype=dtype, direct_attn=True)
+    def prepare_weight_mask_cond_hint(self, x_noisy: Tensor, batched_number, dtype=None, is_sdxl=False):
+        return self._prepare_mask("weight_mask_cond_hint", self.weights.weight_mask, x_noisy, t=None, cond=None, batched_number=batched_number, dtype=dtype, direct_attn=True, is_sdxl=is_sdxl)
 
-    def _prepare_mask(self, attr_name, orig_mask: Tensor, x_noisy: Tensor, t, cond, batched_number, dtype=None, direct_attn=False):
-        # make mask appropriate dimensions, if present
+    def _prepare_mask(self, attr_name, orig_mask: Tensor, x_noisy: Tensor, t, cond, batched_number, dtype=None, direct_attn=False, is_sdxl=False):
         if orig_mask is not None:
             out_mask = getattr(self, attr_name)
-            multiplier = 1 if direct_attn else 8
+            multiplier = 1 if direct_attn else (4 if is_sdxl else 8)
             if self.sub_idxs is not None or out_mask is None or x_noisy.shape[2] * multiplier != out_mask.shape[1] or x_noisy.shape[3] * multiplier != out_mask.shape[2]:
                 self._reset_attr(attr_name)
                 del out_mask
-                # TODO: perform upscale on only the sub_idxs masks at a time instead of all to conserve RAM
-                # resize mask and match batch count
-                out_mask = prepare_mask_batch(orig_mask, x_noisy.shape, multiplier=multiplier, match_shape=True)
+                out_mask = prepare_mask_batch(orig_mask, x_noisy.shape, multiplier=multiplier, match_shape=True, is_sdxl=is_sdxl)
                 actual_latent_length = x_noisy.shape[0] // batched_number
                 out_mask = extend_to_batch_size(out_mask, actual_latent_length if self.sub_idxs is None else self.full_latent_length)
                 if self.sub_idxs is not None:
                     out_mask = out_mask[self.sub_idxs]
-            # make cond_hint_mask length match x_noise
             if x_noisy.shape[0] != out_mask.shape[0]:
                 out_mask = broadcast_image_to_extend(out_mask, x_noisy.shape[0], batched_number)
-            # default dtype to be same as x_noisy
             if dtype is None:
                 dtype = x_noisy.dtype
             setattr(self, attr_name, out_mask.to(dtype=dtype).to(x_noisy.device))

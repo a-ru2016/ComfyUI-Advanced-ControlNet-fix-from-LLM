@@ -191,12 +191,17 @@ class ReferenceAdvanced(ControlBase, AdvancedControlBase):
         if not self.should_apply_effective_masks:
             return self.get_effective_strength() * self.ref_opts.attn_strength
         if is_mid:
-            div = 8
+            div = 8 if not self.is_sdxl else 4
         else:
-            div = self.CHANNEL_TO_MULT[channels]
+            if self.is_sdxl:
+                # SDXLのチャンネル数とスケーリング係数のマッピング
+                sdxl_channel_to_mult = {320: 1, 640: 2, 1280: 4, 1920: 8, 2560: 8}
+                div = sdxl_channel_to_mult.get(channels, 4)
+            else:
+                div = self.CHANNEL_TO_MULT[channels]
         real_mask = torch.ones([self.latent_shape[0], 1, self.latent_shape[2]//div, self.latent_shape[3]//div]).to(dtype=x.dtype, device=x.device) * self.strength * self.ref_opts.attn_strength
         self.apply_advanced_strengths_and_masks(x=real_mask, batched_number=self.batched_number)
-        # mask is now shape [b, 1, h ,w]; need to turn into [b, h*w, 1]
+        # maskを適切な形状に変換
         b, c, h, w = real_mask.shape
         real_mask = real_mask.permute(0, 2, 3, 1).reshape(b, h*w, c)
         return real_mask
@@ -233,16 +238,17 @@ class ReferenceAdvanced(ControlBase, AdvancedControlBase):
         AdvancedControlBase.pre_run_advanced(self, model, percent_to_timestep_function)
         if isinstance(self.cond_hint_original, AbstractPreprocWrapper):
             self.cond_hint_original = self.cond_hint_original.condhint
-        self.model_latent_format = model.latent_format # LatentFormat object, used to process_in latent cond_hint
+        self.model_latent_format = model.latent_format
         self.model_sampling_current = model.model_sampling
-        # SDXL is more sensitive to style_fidelity according to sd-webui-controlnet comments;
-        # prepare all ref_opts accordingly
+        # SDXLかどうかを検出
+        self.is_sdxl = type(model).__name__ == "SDXL"
+        # 以降の処理は変更なし
         all_ref_opts = [self._ref_opts]
         for kf in self.timestep_keyframes.keyframes:
             if kf.has_control_weights() and RefConst.OPTS in kf.control_weights.extras:
                 all_ref_opts.append(kf.control_weights.extras[RefConst.OPTS])
         for ropts in all_ref_opts:
-            if type(model).__name__ == "SDXL":
+            if self.is_sdxl:
                 ropts.attn_style_fidelity = ropts.original_attn_style_fidelity ** 3.0
                 ropts.adain_style_fidelity = ropts.original_adain_style_fidelity ** 3.0
             else:
